@@ -1,0 +1,157 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+DOCUMENTATON = '''
+---
+module: openbsd_rcctl
+author: Sarevok Anchev <sarevok@sigaint.org>
+short_description: Manage OpenBSD services
+version_added: "1.9.4"
+description:
+    -  The openbsd_rcctl module can enable or disable a base system service or a base
+     system or package daemon in rc.conf.local(8) or display its configuration
+     and status.  For a daemon, it can also change the command line arguments,
+     the user to run as, the rc.d(8) action timeout or call its rc.d(8) daemon
+     control script.
+options:
+    name:
+        description:
+        - name of the service to enable/disable/set flags on
+
+    state:
+        description:
+         - whether the service is to be enabled or disabled
+        choices: ['enabled', 'disabled']
+        required: true
+    flags:
+        description:
+        - which flags to set (optional, use flags= to reset).
+        required: false
+        default: None
+'''
+
+EXAMPLES = '''
+# enable the iked daemon (note: this won't actually *start* it)
+- openbsd_rcctl: name=iked state=enabled
+
+# disable the iked daemon (note: this won't actually *stop* it)
+- openbsd_rcctl: name=iked state=disabled
+
+# set some flags on the ntpd daemon
+- openbsd_rcctl: name=ntpd flags=-sv
+
+'''
+
+import json
+
+def main():
+    module = AnsibleModule(
+        argument_spec   = dict(
+            name        = dict(type='str', required=True),
+            state       = dict(default=None, choices=['enabled', 'disabled'], type='str', required=False),
+            flags       = dict(default=None, type='str', required=False)
+        )
+    )
+
+    # set some useful variables
+    p = module.params
+    name, state, flags = p.get("name"), p.get("state"), p.get("flags")
+
+    # sanity check - are we running OpenBSD at all?
+    # No sense in advancing any further otherwise.
+    #
+    # we also check that rcctl actually exists, as this could
+    # be an older OpenBSD install.
+    uname = module.run_command(module.get_bin_path('uname', required=True))
+    if uname[1] != 'OpenBSD\n':
+        module.fail_json(msg="this module will only work on OpenBSD")
+
+    else:   # on OpenBSD
+       rcctl_path = module.get_bin_path('rcctl', required=True) 
+
+    # either one of state or flags must be given
+    if state is None and flags is None:
+        module.fail_json(msg="either one of state or flags must be passed to this module")
+
+    # .. but both can't be present
+    elif state is not None and flags is not None:
+        module.fail_json(msg="'state' and 'flags' must not be given at the same time")
+
+    # use case: state
+    if state:
+        # the module is smart enough to not attempt to enable/disable a service
+        # if it is already disabled.
+        # as far as it can be gathered, this means that in the output of rcctl get,
+        # ${service_name}_flags=NO will be present.
+        rcctl_rc, rcctl_so, rcctl_se = module.run_command("%s get %s" % (rcctl_path, name))
+
+        rcctl_output_lines = rcctl_so.split("\n")
+        strmatch = "%s_flags=" % name
+        already_enabled = False
+
+        for line in rcctl_output_lines:
+            # this line begins with ${service_name}_flags=
+            if line.find(strmatch) == 0:
+                if "NO" not in line:
+                    already_enabled = True
+
+        if state == 'enabled':
+            if already_enabled:
+                module.exit_json()
+
+            rc, so, se = module.run_command("%s set %s status on" % (rcctl_path, name))
+
+        if state == 'disabled':
+            if not already_enabled:
+                module.exit_json()
+
+            rc, so, se = module.run_command("%s set %s status off" % (rcctl_path, name))
+
+        # final checks (for 'state')
+        if rc != 0:
+            module.fail_json(msg=se)
+
+        module.exit_json(changed=True, msg="%s service: %s" % (state.replace("on", "enabled").replace("off", "disabled"), name))
+
+    # use case: flags
+    # flags="" is valid, rcctl will empty the flags.
+    # if it is not passed at all (as in when using state=),
+    # then flags is None, if flags= is passed, then flags is "".
+    #
+    # also, we filter for passing "NO" as flags, as that would disable the daemon.
+    if flags is not None:
+        if flags == "NO":
+            module.fail_json(msg="please use state=disabled instead to disable a service")
+
+        # we find out which flags are set first, in order to compare later and check
+        # whether the state has changed or not.
+        rcctl_rc, rcctl_so, rcctl_se = module.run_command("%s get %s flags" % (rcctl_path, name))
+        rcctl_flags_result = rcctl_so.rstrip()
+
+        # rcctl fails with "rcctl: $name is not enabled" in this case,
+        # we avoid calling it.
+        if rcctl_flags_result == "NO":
+            module.fail_json(msg="please enable %s first in order to set flags" % name)
+
+        # are we trying to change to the same flags that are already there?
+        # in that case, just exit now instead.
+        if rcctl_flags_result == flags:
+            module.exit_json()
+
+        rc, so, se = module.run_command("%s set %s flags %s" % (rcctl_path, name, flags))
+
+        if rc != 0:
+            module.fail_json(msg=se)
+
+        # no errors and flags changed, exit cleanly
+        # if flags=, then print a nice line reflecting that
+        if flags == "":
+            module.exit_json(changed=True, msg="service %s flags reset" % name)
+        else:
+            module.exit_json(changed=True, msg="service %s flags changed to: %s" % (name, flags))
+    
+
+# boilerplate
+from ansible.module_utils.basic import *
+if __name__ == '__main__':
+    main()
